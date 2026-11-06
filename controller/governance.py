@@ -162,6 +162,8 @@ class Governance:
             code, response = self.api.mutate('POST', f'/workflows/{wid}/apply',
                                              {'approval_id': approval['approval_id']})
             if code == 200:
+                if os.getenv('CONTROLLER_TEST_KILL') == 'after_apply_post':
+                    os.kill(os.getpid(), signal.SIGKILL)
                 self.applied(row, ts, {**approval, **response})
             else:
                 self.failed(row, ts, response, code)

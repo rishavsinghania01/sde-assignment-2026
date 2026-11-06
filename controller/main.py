@@ -98,6 +98,7 @@ def run(api, store):
 
     governance.before_apply = approval_is_still_safe
     last_checkpoint = None
+    advanced = None
     while True:
         round_started = monotonic()
         ts = state['ts']
@@ -110,6 +111,12 @@ def run(api, store):
             strategy.assess(workflow, current, state, ts,
                             not state['finished'] and governance.active(wid) is None)
         with store.db:
+            if advanced is not None:
+                origin, events, step_started = advanced
+                store.db.execute('INSERT OR REPLACE INTO rounds VALUES (?,?,?,?)', (
+                    state['sim_minute'], state['sim_minute'] - origin, events,
+                    monotonic() - step_started,
+                ))
             store.set_meta('last_round', state['sim_minute'])
         max_round = max(max_round, monotonic() - round_started)
         if (state['sim_minute'] % 1440 == 0 or state['finished']) and last_checkpoint != state['sim_minute']:
@@ -126,6 +133,7 @@ def run(api, store):
         minutes = state['tick_minutes'] if active else 60
         # Align unattended rounds to the next hour to keep detection on whole buckets.
         minutes = min(minutes, 60 - state['sim_minute'] % 60, state['end_minute'] - state['sim_minute'])
+        step_started = monotonic()
         code, update = api.mutate('POST', '/sim/advance', {'minutes': minutes})
         if code == 409 and update.get('error') == 'finished':
             state = api.get('/sim/state')
@@ -134,6 +142,7 @@ def run(api, store):
         if code != 200:
             raise RuntimeError(f'Advance failed: {code} {update}')
         api.ingest(store, update['new_chunks'])
+        advanced = (state['sim_minute'], sum(ch['events'] for ch in update['new_chunks']), step_started)
         state.update(update)
         max_round = max(max_round, monotonic() - round_started)
 

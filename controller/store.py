@@ -35,6 +35,9 @@ CREATE INDEX IF NOT EXISTS proposals_by_workflow ON proposals(workflow, ts);
 CREATE TABLE IF NOT EXISTS workflow_state (
     workflow TEXT, key TEXT, value TEXT, PRIMARY KEY (workflow, key)
 );
+CREATE TABLE IF NOT EXISTS rounds (
+    sim_minute INTEGER PRIMARY KEY, span_minutes INTEGER, events INTEGER, seconds REAL
+);
 CREATE TABLE IF NOT EXISTS checkpoints (
     sim_minute INTEGER PRIMARY KEY, ts TEXT, elapsed REAL, ingest REAL,
     events INTEGER, lag_minutes REAL, credits REAL, max_round REAL, peak_rss_mib REAL

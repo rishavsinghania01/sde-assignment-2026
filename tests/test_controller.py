@@ -89,3 +89,37 @@ def test_prompt_detection_catches_a_sustained_moderate_spike():
     assert prompt_signal(hourly, reference, 6) is None
     assert prompt_signal(daily, reference, 24) > .007
     assert prompt_signal(Counts(5000, 1200, 600, 24), reference, 24) is None
+
+
+@pytest.mark.parametrize(('phase', 'challenger_pickups', 'challenger_conclusions', 'expected'), [
+    ('experiment', 5000, 3100, 'promote'),
+    ('experiment', 4400, 3100, 'end_experiment'),
+    ('promote', 5000, 1600, 'rollback'),
+])
+def test_experiment_requires_guardrail_and_can_rollback(tmp_path, phase, challenger_pickups,
+                                                       challenger_conclusions, expected):
+    from controller.strategy import Strategy
+
+    store = Store(tmp_path / 'trial.db')
+    ts = '2027-01-06T11:00:00+05:30'
+    trial = {'phase': phase, 'version': 2, 'started': '2027-01-05T10:00:00+05:30',
+             'dimension': 'voice', 'group': 'voice', 'control': 'A', 'challenger': 'B',
+             'baseline': {'A': 1.0}, 'proposal_id': 'trial'}
+    with store.db:
+        store.set('wf', 'experiment', trial)
+        store.db.executemany('INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [
+            ('wf', '2027-01-05T11', 2, 'default', 'P', 'D', 'A', 'W', 10000, 5000, 2500, 0),
+            ('wf', '2027-01-05T11', 2, 'default', 'P', 'D', 'B', 'W', 10000,
+             challenger_pickups, challenger_conclusions, 0),
+        ])
+    workflow = {'workflow_id': 'wf', 'cadence': [2, 2], 'daily_batch': {'size': 1000},
+                'objective': {'primary': 'engagement_rate', 'guardrail': {'pickup_rate_max_drop': .02}}}
+    config = {'version': 2, 'config': {'cohorts': [], 'allocations': {'default': {
+        'voice': {'A': .55, 'B': .45}
+    }}}}
+    plan = Strategy(store, None, None).experiment_plan(workflow, config, {}, ts)
+    assert plan['action'] == expected
+    assert plan['config']['allocations']['default']['voice'] == (
+        {'A': .20, 'B': .80} if expected == 'promote' else {'A': 1.0}
+    )
+    store.close()
