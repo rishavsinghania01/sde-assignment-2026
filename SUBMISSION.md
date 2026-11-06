@@ -5,7 +5,7 @@
 ## 0. TL;DR
 
 The controller learns from the simulator's HTTP event stream, tests welcome and voice changes under approval, and responds to caller-ID and prompt incidents.
-Conclusion rate rose 0.8% relative to baseline on public_01 and 6.8% on public_02. The prompt fix took 315 simulated minutes and seven credits.
+On public_02 the conclusion rate rose 6.0% relative to baseline with no harmful changes. Public_01 ended at -0.2%, inside run-to-run noise. The prompt fix cost seven credits but took 1,530 simulated minutes, because the six-hour detector missed a 4.5% flag rate.
 A crash at each of two remote write boundaries recovered on the same simulator. See the load and crash reports for the measurements.
 Call-time optimisation, a feature store, customer-level trace retention and a supervisor UI are outside this implementation.
 
@@ -30,7 +30,7 @@ Call-time optimisation, a feature store, customer-level trace retention and a su
 | C4 | Call time | Cut | Hour and attempt are confounded without controlled dispatch | Build an experiment that preserves every eligible hour and capacity |
 | C5 | Caller-ID health | Partial | Compare active IDs, shift within policy and retain a probe | Add first-use exploration, carrier data and recovery trials for retired IDs |
 | C6 | Welcome and voice experiments | Built | One randomised contrast at a time on engagement-primary workflows | Add feature slices and a powered interaction test when volume supports it |
-| C7 | Promotion and rollback | Built | Guardrails gate promotion and retained control supports a harm stop | Calibrate the sequential safety rules and exercise promotion/decay on a dedicated fixture |
+| C7 | Promotion and rollback | Built | An expected-loss readout promotes to 80/20, and the retained control supports a harm stop | Exercise decay on a dedicated fixture, since no public scenario has one |
 | C8 | Hallucination response | Built | A safety incident needs a separate diagnosis and an approved, validated fix | Add manual QA sampling and alternative candidate review when engagement drops |
 | C9 | Governance | Partial | Versioned approval, reconciliation, rate limits and policy-permitted caller auto-apply cover the write paths | Add multi-action batching, cancellation and named approvals to the API |
 | C10 | Impact, reach and dry run | Partial | Give approvers the counts, method and uncertainty behind each request | Count active distinct eligible leads and calibrate impact against realised lift |
@@ -103,8 +103,20 @@ The controller uses Python's standard library and the starter's HTTPX dependency
 
 - **Cohorts.** Decisions for allocations use the default cohort and an exact config version. Start an experiment only after 500 baseline connections and only when at least three simulated days remain. Prompt monitoring uses the workflow because a prompt applies everywhere. We skip default allocation changes when an explicit cohort would inherit the change.
 - **Design.** On engagement-primary workflows, give an eligible challenger 45% and leave 55% on the incumbent. Test one dimension at a time. After an applied voice test, consider a welcome test before another voice. Candidate order is deterministic and each challenger is tried at most once per dimension in a workflow. This holds the other dimensions steady for a comparison and leaves voice-by-welcome interactions unestimated.
-- **Winner.** One efficacy readout at the first eligible check after 24 hours, with at least 3,000 dials and 700 connections per arm. If that support is still missing after 96 hours, request an end to the experiment. The promotion gate is a lower one-sided bound of at least +1 percentage point on engagement and a pickup noninferiority bound within the declared margin. The primary cutoff is z=2.807, nominal one-sided 0.25% per read or up to 1% across four independent or dependent reads by the union bound. Treat that as a planning approximation. There may be more than four trials, repeat callers can inflate variance beyond the 1.5 factor, and an external config change can reset an observation window.
-- **Decay.** An 80/20 promoted split keeps a live control. Look at up to 48 hours of promoted traffic, with at least 350 dials and 120 connections in each arm. An upper bound at z=4 that clears a 1.5-point engagement loss or breaks the guardrail triggers a rollback request. The same harm stop applies during exploration. Repeated safety looks are approximate and are not efficacy looks. Small effects and low-volume arms can take days to show up.
+- **Winner.** The readout runs every round once each arm has 24 hours, 3,000 dials and 700 connections. It treats the lift as normal, using the 1.5 variance factor, and computes the expected loss of each choice: the primary-KPI points we expect to give up by picking that arm if it turns out to be the worse one. Promote when the lift is positive, the challenger's expected loss is at most 0.25 points, and the posterior chance of the guardrail dropping past its margin is under 10%. Restore control when the lift is negative and control's expected loss is at most 0.25 points. A trial still undecided at 96 hours restores control. The decision is stored when it is made, so a slow approval cannot reopen it. Only a harm stop can.
+- **Why expected loss.** My first version took one fixed read and wanted a +1 point lower bound at z=2.807. With about 800 connections per arm that needs an observed gap near 9 points, while the grader reports effects of 1 to 2 points. It never promoted. Every public trial ended by restoring control, including two that the grader marked as better. A fixed test that can detect 2 points would need 10,000 to 15,000 connections per arm, which is about a month at this volume. [tools/readout_simulation.py](tools/readout_simulation.py) runs the real `readout` on synthetic trials at nw_renewal volume ([output](reports/readout_simulation.txt)):
+
+  | true engagement lift | old rule promotes | new rule promotes | new rule restores |
+  |---|---:|---:|---:|
+  | -2 points | 0.0% | 4.0% | 96.0% |
+  | -1 point | 0.0% | 13.1% | 86.9% |
+  | 0 | 0.0% | 25.2% | 74.8% |
+  | +1 point | 0.0% | 45.7% | 54.3% |
+  | +2 points | 0.1% | 65.1% | 34.9% |
+  | +2 points with pickup -3 | 0.0% | 0.6% | 99.4% |
+
+  Expected loss bounds the cost of a wrong pick. It does not control a false-positive rate: with no true effect it promotes a quarter of the time, which costs nothing in expectation but uses an approval. A wrong promotion still leaves 20% on control, and the harm stop below watches it. Undecided trials are the price. A challenger with no effect runs a median 86 hours, which on an 8-day scenario leaves room for about two trials per workflow. A 72-hour deadline would save about 17 hours per null trial and drop power at +2 points from 66% to 50%, so I kept 96.
+- **Decay.** An 80/20 promoted split keeps a live control. Look at up to 48 hours of promoted traffic, with at least 350 dials and 120 connections in each arm. An upper bound at z=4 that clears a 1.5-point engagement loss or breaks the guardrail triggers a rollback request. The same harm stop applies during exploration. Repeated safety looks are approximate and are not efficacy looks. Small effects and low-volume arms can take days to show up. The public runs promoted three variants and none decayed, so rollback has only run in unit tests.
 - **Caller ID.** Compare active caller IDs within the current default cohort and version over eight hours. Require 180 dials on each compared arm and a pickup lower bound above 2.5 points. The previous week supplies a health reference, and a 4.5-point historical drop classifies an incident. Rotate toward a stronger observed ID, bound the move by policy, and leave about 5% to measure the weak ID. A weaker ID may see fewer than 180 calls after rotation, which delays a further step. Schedule and per-person call time are out of scope.
 - **Guardrail.** Pickup uses dials as its denominator. Engagement uses connections. Promotion requires a separate noninferiority check at z=1.645. For caller rotation, check conditional engagement even when pickup is the declared guardrail. In an incident with too few pickups for arm-level noninferiority, use a smaller move and bound engagement risk for the affected fraction. Verify the post-change mix separately. Concluded leads per upload is a scenario outcome reported by the grader.
 
@@ -131,9 +143,9 @@ One LLM call costs three credits. A validation run tests 400 conversations and c
 
 | Public_02 incident | Observed timeline (IST, simulated) |
 |---|---|
-| Kestrel caller ID flagged, D2 10:00 | First controller rotation at D2 15:00. Flagged-ID share was 35.9% on D2, 10.8% on D3, and 5.0% on D7. |
-| Kestrel supervisor prompt edit, D3 11:30 | At 16:00 the detector saw 27 flags in 371 connections versus 109 in 7,258 in the reference. P1 passed 98.5% of 400 validations. Approval `apr_00006` was decided at 16:21. v7 applied at 16:45, 315 minutes after the edit. By 21:00 there were four flags in 326 post-change connections, and no detected pickup guardrail regression. |
-| Northwind renewal supervisor edit, D5 15:00 | The controller preserved supervisor v5, invalidated its trial and paused elective experiments for 24 hours. The stale-approval test separately exercises an approval crossing a supervisor version change. |
+| Kestrel caller ID flagged, D2 10:00 | First controller rotation at D2 14:00. Flagged-ID share was 30.6% on D2, 10.4% on D3, and 4.6% on D7. |
+| Kestrel supervisor prompt edit, D3 11:30 | P2 ran at about 4.5% flags, just under the six-hour floor, so no six-hour window fired. The 24-hour window fired at D4 12:00 with 47 flags in 965 connections against 94 in 6,668 in the reference. P1 passed 98.5% of 400 validations. Approval `apr_00004` was decided at 12:45 and v6 applied at 13:00, 1,530 minutes after the edit. By 17:00 there were four flags in 300 post-change connections and no detected pickup guardrail regression. An earlier run of the same scenario saw 7% flags and fixed it in 315 minutes. |
+| Northwind renewal supervisor edit, D5 15:00 | The controller preserved supervisor v4, dropped its promoted V2 split from tracking and paused elective experiments for 24 hours. The stale-approval test separately exercises an approval crossing a supervisor version change. |
 
 ## 8. Scale
 
@@ -174,18 +186,21 @@ GET failures other than 429 and 5xx fail visibly. Transport errors, 429 and 5xx 
 
 ```sh
 .venv/bin/python -m controller.audit runs/controller02.sqlite3 ks_cancel \
-  --since 2027-01-07T16:00 --limit 6
+  --since 2027-01-08T12:00 --limit 6
 ```
 
 The [captured output](reports/audit_public_02.txt) gives the diagnosis, evidence and approval ID, the applied config version, and the live QA check. A compact reading of those rows follows.
 
 ```text
-16:00  prompt_incident       P2, 27/371 flags; historical reference 109/7258
-16:00  proposal_intent       P2 -> P1, validation val_00001, pass rate 0.985
-16:21  approval_decided      apr_00006 approved
-16:45  proposal_applied      prompt_fix, version 7, approval apr_00006
-21:00  change_verification   P1, 4/326 flags; no detected pickup guardrail regression
+12:00  prompt_incident       P2, 47/965 flags over 24 h; historical reference 94/6668
+12:00  proposal_intent       P2 -> P1, validation val_00001, pass rate 0.985
+12:45  approval_decided      apr_00004 approved
+13:00  proposal_applied      prompt_fix, version 6, approval apr_00004
+13:00  config_changed        controller_approved, prompt_version
+17:00  change_verification   P1, 4/300 flags; no detected pickup guardrail regression
 ```
+
+The W2 trial on this workflow waited until 17:00 to start. A new trial bumps the config version, and that would have cut the prompt check short.
 
 The audit uses the simulator's approval identifier because there is no approver-name field. For on-call, page on a growing ingest backlog during dialling, an unreconciled apply outcome, or a high-confidence active prompt incident blocked on credits or approval. Check the chunk cursor, the proposal ID and live approval state, or the recent flag counts and reserve, respectively. Ordinary declines, stale requests caused by supervisor edits, and underpowered experiments belong in a digest. Checkpoints record credits and ingestion progress. Query `audit` by timestamp and kind for decisions per hour and `rounds` for measured processing times. Alert delivery remains a production integration.
 
@@ -195,25 +210,27 @@ The audit uses the simulator's approval identifier because there is no approver-
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.347 | +1.7% | 0.245 | +0.3% | 0.498 | +1.2% | 2% | 54 (57) |
-| nw_kyc | 0.373 | +1.7% | 0.244 | +1.0% | 0.600 | +0.4% | 0% | 26 (21) |
-| nw_renewal | 0.413 | -0.7% | 0.260 | -1.6% | 0.547 | +1.0% | 3% | 47 (54) |
-| ALL | 0.375 | +0.8% | 0.250 | -0.3% | 0.535 | +1.0% | 2% | 127 (132) |
+| ks_cancel | 0.342 | +0.2% | 0.246 | +0.6% | 0.490 | -0.4% | 4% | 69 (57) |
+| nw_kyc | 0.367 | +0.0% | 0.243 | +0.6% | 0.594 | -0.6% | 0% | 16 (21) |
+| nw_renewal | 0.413 | -0.7% | 0.261 | -1.1% | 0.544 | +0.5% | 0% | 49 (54) |
+| ALL | 0.371 | -0.2% | 0.251 | -0.0% | 0.529 | -0.1% | 2% | 134 (132) |
 
-Eight changes applied. Four were neutral, two beneficial and two harmful by the grader. Both harmful changes restored the incumbent after an inconclusive welcome trial and removed an option that the grader later showed was better. Northwind renewal's conclusion rate still fell 0.7% relative to baseline despite higher engagement.
+Six changes applied: four neutral, two beneficial and none harmful by the grader. Both workflows started with a V2 voice trial that had no real effect. Kestrel's ended at D3 when control's expected loss fell under the tolerance. Northwind renewal's ran to the 96-hour deadline, and the approver rejected the first request to end it, so it did not close until D5. Kestrel then tested W2 and promoted it to 80% at D7. That promotion was beneficial but came too late to move the eight-day totals. My first version of the readout scored +0.8% here with two harmful changes, both restores of a welcome message the grader showed was better. The new readout traded that for slower null trials, and the outcome change is inside the noise described below.
 
 ### public_02_incidents
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.285 | +21.1% | 0.200 | +10.5% | 0.500 | +6.8% | 32% | 93 (348) |
-| nw_kyc | 0.372 | -0.6% | 0.236 | +0.7% | 0.601 | -1.3% | 0% | 21 (29) |
-| nw_renewal | 0.434 | +0.3% | 0.262 | -0.2% | 0.555 | +0.2% | 5% | 54 (54) |
-| ALL | 0.353 | +6.8% | 0.228 | +4.1% | 0.542 | +1.7% | 15% | 168 (431) |
+| ks_cancel | 0.288 | +22.4% | 0.203 | +12.1% | 0.497 | +6.3% | 33% | 107 (348) |
+| nw_kyc | 0.363 | -2.9% | 0.237 | +1.2% | 0.585 | -3.9% | 0% | 20 (29) |
+| nw_renewal | 0.427 | -1.3% | 0.260 | -1.0% | 0.552 | -0.4% | 8% | 58 (54) |
+| ALL | 0.351 | +6.0% | 0.229 | +4.4% | 0.536 | +0.7% | 17% | 185 (431) |
 
-Thirteen changes applied. Seven were beneficial, three neutral and three harmful. The beneficial incident changes rotated away from the flagged caller ID and replaced the unsafe prompt. Two harmful changes restored incumbents after inconclusive trials. The other was a Northwind voice test after the supervisor edit. The grader's effect labels use hidden truth. The controller did not have that information at decision time. Kestrel's conclusion rate rose 21.1% relative to baseline. Northwind KYC's outcome dipped 0.6% without a controller change on that workflow, so the comparison alone does not attribute an effect to the controller.
+Ten changes applied: seven beneficial, three neutral and none harmful. The beneficial changes were three caller rotations, the prompt fix, the start of Northwind's V2 trial, and Kestrel's W2 trial and its promotion. Northwind promoted V2 at D3, graded neutral at +0.010, just under the grader's cut. The D5 supervisor edit then ended that tracking. The first version applied thirteen changes here with three harmful: two restores after inconclusive trials and a voice test after the supervisor edit. The grader's labels use hidden truth that the controller did not have at decision time.
 
-I would preregister an extra powered read for promising inconclusive trials, budget its additional exposure with Compliance, and skip trials whose expected volume cannot detect a worthwhile effect. The public reports do not demonstrate winner decay. The unit suite exercises promotion, a failed pickup guardrail and rollback with constructed rollup counts.
+Kestrel's conclusion rate rose 22.4%, most of it from the caller rotation and the prompt fix. Northwind KYC, which the controller never changes, came out at -0.6%, +2.3% and -2.9% across three runs of this scenario, because controller actions elsewhere shift the shared random draws. The overall figure moved from +6.8% to +6.0% between versions, and almost all of that is KYC. Differences of a few percent between controller versions are inside that spread.
+
+The remaining limit is throughput. One dimension per trial leaves room for about two trials per workflow in eight days. The simulator samples voice and welcome independently on each dial, so running both contrasts in one trial would roughly double that, at little cost in power if the two do not interact strongly. The public reports do not show winner decay. The unit suite covers promotion, a failed pickup guardrail, rollback and the undecided-until-deadline path with constructed rollup counts.
 
 ## 12. Trade-offs & rejected alternatives
 
@@ -221,13 +238,14 @@ I would preregister an extra powered read for promising inconclusive trials, bud
 |---|---|---|
 | Raw event warehouse | Customer-level queries and clustered uncertainty | Hourly aggregate plus administrative event audit keeps memory and storage bounded in the assignment |
 | One multi-arm factorial trial | Could identify voice/welcome interactions | One dimension and one challenger per trial gives an interpretable contrast with less traffic |
+| One fixed read with a +1 point lower bound | Simple false-positive story | It could not see 1 to 2 point effects inside the horizon and ended every trial by restoring control. Replaced with an expected-loss readout and a 96-hour deadline |
 | Auto-apply customer-facing changes when allowed | Removes approval delays | Take the human path for welcome, voice and prompt changes |
 | Per-lead hour preferences | Could improve pickup for returning callers | Cut until there is a controlled dispatch experiment and comparable attempt data |
 | New infrastructure | Allows several controller replicas | SQLite keeps this single-host run operationally small. A production deployment can reuse Postgres |
 
 ## 13. Known weaknesses
 
-The default cohort can hide meaningful feature slices, and a fixed variance multiplier is no replacement for clustering by person. The public experiment readouts mostly exhausted the practical sample budget with wide intervals. The caller comparison cannot rank unused IDs. The prompt fix verifier can identify a possible trade-off, but cannot estimate causality from a pre/post comparison. Hidden scenarios and promoted-winner decay were not observed in the public evidence. Per-workflow rate limits do not coordinate a shared approver across workflows. A long approval decision can delay responding to a newer incident on the same workflow. Reach is an estimate. SQLite does not provide cross-host failover.
+The default cohort can hide meaningful feature slices, and a fixed variance multiplier is no replacement for clustering by person. The readout promotes about a quarter of challengers with no effect and 4% of those two points worse. The retained control and the harm stop are the backstop. A trial with no effect runs about 86 hours. The six-hour prompt detector misses flag rates near 4.5%, which cost a day on public_02. A change-point check on a prompt the supervisor just shipped would catch that sooner. When a supervisor edit invalidates a running trial, the split it left in the config stays live and untracked. On public_02 Kestrel kept V2 at 45% for the rest of the run. The caller comparison cannot rank unused IDs. The prompt fix verifier can identify a possible trade-off, but cannot estimate causality from a pre/post comparison. Hidden scenarios and promoted-winner decay were not observed in the public evidence. Per-workflow rate limits do not coordinate a shared approver across workflows. A long approval decision can delay responding to a newer incident on the same workflow. Reach is an estimate. SQLite does not provide cross-host failover.
 
 ## 14. If this went to production at Formi next month
 

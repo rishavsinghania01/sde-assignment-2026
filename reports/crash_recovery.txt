@@ -1,5 +1,5 @@
 SIGKILL at 2027-01-04T10:00:00+05:30 on nw_renewal base v1, local state=intent, remote state=pending (apr_00001).
-SIGKILL after apply on ks_cancel, local state=approved, remote state=applied (apr_00002).
-Recovered apr_00001 exactly once, terminal state=rejected.
-Reconciled apr_00002 as v2 exactly once at 2027-01-04T12:00:00+05:30.
-Finished at 2027-01-14T00:00:00+05:30. Chunks 3 before kill, 206 after restart. Events 324,305, last ID 324,305. SQLite integrity check passed.
+SIGKILL after apply on nw_renewal, local state=approved, remote state=applied (apr_00001).
+Recovered apr_00001 exactly once, terminal state=applied.
+Reconciled apr_00001 as v2 exactly once at 2027-01-04T13:00:00+05:30.
+Finished at 2027-01-14T00:00:00+05:30. Chunks 3 before kill, 195 after restart. Events 324,301, last ID 324,301. SQLite integrity check passed.
