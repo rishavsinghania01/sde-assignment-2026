@@ -2,7 +2,7 @@ import copy
 import json
 from datetime import datetime, timedelta
 
-from .learning import Counts, bounds, guardrail_ok, move_weight, normalized
+from .learning import Counts, bounds, guardrail_ok, move_weight, normalized, readout
 
 
 def time_before(ts, hours):
@@ -265,6 +265,9 @@ class Strategy:
         if trial is None:
             if primary != 'engagement_rate' or state['end_minute'] - state['sim_minute'] < 3 * 1440:
                 return None
+            # A new trial bumps the config version, which would end the live check on a prompt fix.
+            if self.store.get(wid, 'verify_prompt_version') is not None:
+                return None
             previous = self.store.db.execute(
                 """SELECT plan FROM proposals WHERE workflow=? AND state='applied'
                    AND json_extract(plan, '$.action')='experiment' ORDER BY rowid DESC LIMIT 1""",
@@ -326,8 +329,7 @@ class Strategy:
         base, new = counts.get(control, Counts()), counts.get(challenger, Counts())
         minimum_dials = min(base.dials, new.dials)
         minimum_connected = min(base.connected, new.connected)
-        z = 2.807
-        lower, upper = bounds(new, base, primary, z)
+        lower, upper = bounds(new, base, primary, 1.96)
         guard_bounds = {metric: bounds(new, base, metric.removesuffix('_max_drop'), 1.645)
                         for metric in guardrail}
         early_loss = minimum_dials >= 350 and minimum_connected >= 120 and (
@@ -348,17 +350,20 @@ class Strategy:
             reason = 'The retained control provides a contemporaneous reference for a conservative harm stop.'
             impact = abs(new.rate(primary) - base.rate(primary))
         else:
-            enough = minimum_dials >= 3000 and minimum_connected >= 700 and elapsed >= timedelta(hours=24)
-            expired = elapsed >= timedelta(hours=96)
-            if not (early_loss or enough or expired):
-                return None
-            # Freeze the first efficacy read. A delayed approval cannot turn an
-            # inconclusive look into repeated significance tests.
+            # Look every round once support is there, and stop at the first decision.
+            # The decision is stored so a slow approval cannot reopen it; only a harm
+            # stop overrides it.
             evaluation_key = f'evaluation:{trial["proposal_id"]}:{trial["version"]}'
             evaluation = self.store.get(wid, evaluation_key)
             if evaluation is None or early_loss:
-                won = enough and not early_loss and lower >= .01 and guardrail_ok(new, base, guardrail, 1.645)
-                evaluation = {'won': won, 'evidence': evidence, 'lower': lower}
+                enough = minimum_dials >= 3000 and minimum_connected >= 700 and elapsed >= timedelta(hours=24)
+                decision, risk = readout(new, base, primary, guardrail) if enough else (None, {})
+                if early_loss or (decision is None and elapsed >= timedelta(hours=96)):
+                    decision = 'restore'
+                if decision is None:
+                    return None
+                evaluation = {'won': decision == 'promote', 'evidence': {**evidence, **risk},
+                              'lift': risk.get('lift', 0.0)}
                 with self.store.db:
                     self.store.set(wid, evaluation_key, evaluation)
                     self.store.audit(wid, ts, 'experiment_readout', evaluation)
@@ -366,12 +371,14 @@ class Strategy:
             if evaluation['won']:
                 action, weights = 'promote', {control: .20, challenger: .80}
                 summary = f'Raise {challenger} to 80% and retain {control} as a control'
-                reason = 'The fixed readout clears the primary lift floor and the guardrail noninferiority bound.'
-                impact = .35 * evaluation['lower']
+                reason = ('Expected loss from choosing the challenger is under 0.25 points of the primary KPI '
+                          'and the chance of a guardrail breach is under 10%.')
+                impact = .8 * evaluation['lift']
             else:
                 action, weights = 'end_experiment', trial['baseline']
                 summary = f'End the trial and restore {control}'
-                reason = 'The challenger triggered a harm stop or did not meet both promotion criteria at the readout.'
+                reason = ('The challenger triggered a harm stop, is at most marginally better than control, '
+                          'or stayed undecided for 96 hours.')
                 impact = abs(new.rate(primary) - base.rate(primary)) if early_loss else 0
         plan = self.plan(workflow, cfg, ts, action, dimension, weights, summary, reason, evidence, impact)
         return {**plan, 'experiment': trial}
