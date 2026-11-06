@@ -38,3 +38,54 @@ def test_chunk_replay_and_bad_chunk_are_atomic(tmp_path):
     assert store.cursor == 0
     assert tuple(store.db.execute('select dials, connected, engaged, flags from calls').fetchone()) == (1, 1, 0, 1)
     store.close()
+
+
+def test_stale_approval_never_calls_apply(tmp_path):
+    from controller.governance import Governance
+
+    class API:
+        def __init__(self):
+            self.posts = []
+
+        def get(self, path, **params):
+            if path == '/approvals/a1':
+                return {'status': 'approved', 'approval_id': 'a1'}
+            return {'version': 2}
+
+        def mutate(self, *args):
+            self.posts.append(args)
+            raise AssertionError('Must never send a stale apply')
+
+    store = Store(tmp_path / 'governance.db')
+    api = API()
+    governor = Governance(store, api)
+    now = '2027-01-04T11:00:00+05:30'
+    with store.db:
+        store.db.execute('INSERT INTO proposals VALUES (?,?,?,?,?,?,?,?,?,?)', (
+            'p1', 'wf', now, 'approval', 'pending', '{"base_version":1}', '{}', 'a1', None, now
+        ))
+    governor.reconcile(governor.active('wf'), now)
+    assert not api.posts
+    assert store.db.execute('SELECT state FROM proposals').fetchone()[0] == 'stale'
+
+
+def test_auto_route_requires_permission_for_the_entire_diff():
+    from controller.governance import route_for
+
+    policy = {'auto_apply': {'enabled': True, 'allowed_dims': ['caller_id'], 'max_shift': .2}}
+    config = {'allocations': {'default': {'caller_id': {'A': .5, 'B': .5}}}}
+    for weight, expected in ((.65, 'auto'), (.75, 'approval')):
+        changed = {'allocations': {'default': {'caller_id': {'A': weight, 'B': 1 - weight}}}}
+        assert route_for(policy, config, changed, 'caller_id') == expected
+    assert route_for(policy, config, config, 'prompt_version') == 'approval'
+
+
+def test_prompt_detection_catches_a_sustained_moderate_spike():
+    from controller.strategy import prompt_signal
+
+    reference = Counts(25000, 6000, 3000, 92)
+    hourly = Counts(1400, 300, 150, 15)
+    daily = Counts(5000, 1200, 600, 62)
+    assert prompt_signal(hourly, reference, 6) is None
+    assert prompt_signal(daily, reference, 24) > .007
+    assert prompt_signal(Counts(5000, 1200, 600, 24), reference, 24) is None
